@@ -23,6 +23,9 @@ func DialSerialNetwork(ctx context.Context, dialer N.Dialer, network string, des
 	if parallelDialer, isParallel := dialer.(ParallelNetworkDialer); isParallel {
 		return parallelDialer.DialParallelNetwork(ctx, network, destination, destinationAddresses, strategy, interfaceType, fallbackInterfaceType, fallbackDelay)
 	}
+	if C.TCPConcurrent && len(destinationAddresses) > 1 {
+		return dialConcurrentNetwork(ctx, dialer, network, destination, destinationAddresses, strategy, interfaceType, fallbackInterfaceType, fallbackDelay)
+	}
 	var errors []error
 	if parallelDialer, isParallel := dialer.(ParallelInterfaceDialer); isParallel {
 		for _, address := range destinationAddresses {
@@ -40,6 +43,53 @@ func DialSerialNetwork(ctx context.Context, dialer N.Dialer, network string, des
 			}
 			errors = append(errors, err)
 		}
+	}
+	return nil, E.Errors(errors...)
+}
+
+func dialConcurrentNetwork(ctx context.Context, dialer N.Dialer, network string, destination M.Socksaddr, destinationAddresses []netip.Addr, strategy *C.NetworkStrategy, interfaceType []C.InterfaceType, fallbackInterfaceType []C.InterfaceType, fallbackDelay time.Duration) (net.Conn, error) {
+	type dialResult struct {
+		net.Conn
+		error
+		address netip.Addr
+	}
+	returned := make(chan struct{})
+	defer close(returned)
+
+	dialCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	results := make(chan dialResult) // 无缓冲,修正泄漏问题
+
+	racer := func(address netip.Addr) {
+		var conn net.Conn
+		var err error
+		if parallelDialer, isParallel := dialer.(ParallelInterfaceDialer); isParallel {
+			conn, err = parallelDialer.DialParallelInterface(dialCtx, network, M.SocksaddrFrom(address, destination.Port), strategy, interfaceType, fallbackInterfaceType, fallbackDelay)
+		} else {
+			conn, err = dialer.DialContext(dialCtx, network, M.SocksaddrFrom(address, destination.Port))
+		}
+		select {
+		case results <- dialResult{Conn: conn, error: err, address: address}:
+		case <-returned:
+			if conn != nil {
+				conn.Close()
+			}
+		}
+	}
+
+	for _, address := range destinationAddresses {
+		go racer(address)
+	}
+
+	var errors []error
+	for i := 0; i < len(destinationAddresses); i++ {
+		res := <-results
+		if res.error == nil {
+			cancel()
+			return res.Conn, nil
+		}
+		errors = append(errors, res.error)
 	}
 	return nil, E.Errors(errors...)
 }
@@ -129,6 +179,57 @@ func DialParallelNetwork(ctx context.Context, dialer ParallelInterfaceDialer, ne
 	}
 }
 
+// listenConcurrentNetworkPacket 是 dialConcurrentNetwork 的 UDP/PacketConn 版本。
+// 注意: UDP 的 ListenPacket/连接建立不会做真实的远端可达性握手验证,
+// 多个地址可能几乎同时"成功",此处并发的收益主要是快速跳过本机路由不可达的地址,
+// 并不等同于 TCP 并发竞速能挑出"真正最快可达"的远端服务器。
+func listenConcurrentNetworkPacket(ctx context.Context, dialer N.Dialer, destination M.Socksaddr, destinationAddresses []netip.Addr, strategy *C.NetworkStrategy, interfaceType []C.InterfaceType, fallbackInterfaceType []C.InterfaceType, fallbackDelay time.Duration) (net.PacketConn, netip.Addr, error) {
+	type packetResult struct {
+		net.PacketConn
+		error
+		address netip.Addr
+	}
+	returned := make(chan struct{})
+	defer close(returned)
+
+	dialCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	results := make(chan packetResult) // 无缓冲,修正泄漏问题
+
+	racer := func(address netip.Addr) {
+		var conn net.PacketConn
+		var err error
+		if parallelDialer, isParallel := dialer.(ParallelInterfaceDialer); isParallel {
+			conn, err = parallelDialer.ListenSerialInterfacePacket(dialCtx, M.SocksaddrFrom(address, destination.Port), strategy, interfaceType, fallbackInterfaceType, fallbackDelay)
+		} else {
+			conn, err = dialer.ListenPacket(dialCtx, M.SocksaddrFrom(address, destination.Port))
+		}
+		select {
+		case results <- packetResult{PacketConn: conn, error: err, address: address}:
+		case <-returned:
+			if conn != nil {
+				conn.Close()
+			}
+		}
+	}
+
+	for _, address := range destinationAddresses {
+		go racer(address)
+	}
+
+	var errors []error
+	for i := 0; i < len(destinationAddresses); i++ {
+		res := <-results
+		if res.error == nil {
+			cancel()
+			return res.PacketConn, res.address, nil
+		}
+		errors = append(errors, res.error)
+	}
+	return nil, netip.Addr{}, E.Errors(errors...)
+}
+
 func ListenSerialNetworkPacket(ctx context.Context, dialer N.Dialer, destination M.Socksaddr, destinationAddresses []netip.Addr, strategy *C.NetworkStrategy, interfaceType []C.InterfaceType, fallbackInterfaceType []C.InterfaceType, fallbackDelay time.Duration) (net.PacketConn, netip.Addr, error) {
 	if len(destinationAddresses) == 0 {
 		if !destination.IsIP() {
@@ -138,6 +239,9 @@ func ListenSerialNetworkPacket(ctx context.Context, dialer N.Dialer, destination
 	}
 	if parallelDialer, isParallel := dialer.(ParallelNetworkDialer); isParallel {
 		return parallelDialer.ListenSerialNetworkPacket(ctx, destination, destinationAddresses, strategy, interfaceType, fallbackInterfaceType, fallbackDelay)
+	}
+	if C.TCPConcurrent && len(destinationAddresses) > 1 {
+		return listenConcurrentNetworkPacket(ctx, dialer, destination, destinationAddresses, strategy, interfaceType, fallbackInterfaceType, fallbackDelay)
 	}
 	var errors []error
 	if parallelDialer, isParallel := dialer.(ParallelInterfaceDialer); isParallel {
