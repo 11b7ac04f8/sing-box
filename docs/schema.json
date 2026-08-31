@@ -5174,6 +5174,9 @@
         },
         "urltest_unified_delay": {
           "type": "boolean"
+        },
+        "tcp_concurrent": {
+          "type": "boolean"  
         }
       },
       "additionalProperties": false
